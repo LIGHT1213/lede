@@ -1,4 +1,4 @@
-name: Build LEDE (ISO & PVE/Qcow2) with Passwall & OpenClash
+name: Build LEDE (Stable ISO/QCOW2)
 
 on:
   repository_dispatch:
@@ -10,7 +10,6 @@ on:
         default: 'false'
 
 env:
-  # 建议使用 coolsnowwolf 的官方源以保证最新，如果必须用 LIGHT1213 的 fork，请修改此处链接
   REPO_URL: https://github.com/coolsnowwolf/lede
   REPO_BRANCH: master
   FEEDS_CONF: feeds.conf.default
@@ -25,10 +24,33 @@ jobs:
     - name: Checkout
       uses: actions/checkout@v4
 
-    - name: Initialization environment
+    # --- 修复核心：清理空间 + 挂载 Swap ---
+    - name: Free Disk Space (Maximize)
+      uses: jlumbroso/free-disk-space@main
+      with:
+        # 移除不需要的大文件，释放约 10-12GB 空间
+        tool-cache: true
+        android: true
+        dotnet: true
+        haskell: true
+        large-packages: true
+        docker-images: true
+        swap-storage: false
+
+    - name: Initialize Environment & Create Swap
       env:
         DEBIAN_FRONTEND: noninteractive
       run: |
+        # 1. 创建 8GB SWAP 虚拟内存 (防止 OOM 内存溢出导致 Runner 断连)
+        echo "Creating SWAP file..."
+        sudo fallocate -l 8G /swapfile
+        sudo chmod 600 /swapfile
+        sudo mkswap /swapfile
+        sudo swapon /swapfile
+        echo "Swap info:"
+        free -h
+
+        # 2. 安装编译依赖
         sudo rm -rf /etc/apt/sources.list.d/* /usr/share/dotnet /usr/local/lib/android /opt/ghc
         sudo -E apt-get -qq update
         sudo -E apt-get -qq install $(curl -fsSL git.io/depends-ubuntu-2204)
@@ -45,14 +67,12 @@ jobs:
         git clone $REPO_URL -b $REPO_BRANCH openwrt
         ln -sf /workdir/openwrt $GITHUB_WORKSPACE/openwrt
 
-    - name: Load custom feeds (Passwall & OpenClash)
+    - name: Load custom feeds
       run: |
         cd openwrt
-        # 添加 Passwall 源
         echo "src-git passwall_packages https://github.com/xiaorouji/openwrt-passwall-packages.git;main" >> "feeds.conf.default"
         echo "src-git passwall https://github.com/xiaorouji/openwrt-passwall.git;main" >> "feeds.conf.default"
         
-        # 添加 OpenClash
         mkdir -p package/custom
         git clone --depth 1 https://github.com/vernesong/OpenClash.git package/custom/luci-app-openclash
 
@@ -68,40 +88,25 @@ jobs:
         [ -e $CONFIG_FILE ] && mv $CONFIG_FILE openwrt/.config
         
         cd openwrt
-        
-        # 如果没有配置文件，先生成默认 x86_64 配置
         if [ ! -f .config ]; then
           make defconfig
         fi
 
-        # =======================================================
-        # 1. 强制开启 插件 (Passwall & OpenClash)
-        # =======================================================
+        # 开启插件
         sed -i 's/# CONFIG_PACKAGE_luci-app-passwall is not set/CONFIG_PACKAGE_luci-app-passwall=y/' .config
         sed -i 's/# CONFIG_PACKAGE_luci-app-passwall_INCLUDE_Xray is not set/CONFIG_PACKAGE_luci-app-passwall_INCLUDE_Xray=y/' .config
         sed -i 's/# CONFIG_PACKAGE_luci-app-passwall_INCLUDE_SingBox is not set/CONFIG_PACKAGE_luci-app-passwall_INCLUDE_SingBox=y/' .config
         sed -i 's/# CONFIG_PACKAGE_luci-app-openclash is not set/CONFIG_PACKAGE_luci-app-openclash=y/' .config
 
-        # =======================================================
-        # 2. 强制开启 镜像输出格式 (ISO 和 QCOW2)
-        # =======================================================
-        
-        # 启用 ISO 镜像 (Legacy / UEFI)
+        # 开启镜像格式 (ISO & PVE)
         sed -i 's/# CONFIG_ISO_IMAGES is not set/CONFIG_ISO_IMAGES=y/' .config
-        
-        # 启用 QCOW2 镜像 (PVE/KVM 专用格式)
         sed -i 's/# CONFIG_TARGET_IMAGES_QCOW2 is not set/CONFIG_TARGET_IMAGES_QCOW2=y/' .config
-        
-        # 确保生成 .img.gz (通用格式，PVE 也可以 importdisk 使用)
         sed -i 's/# CONFIG_TARGET_IMAGES_GZIP is not set/CONFIG_TARGET_IMAGES_GZIP=y/' .config
         
-        # 调整分区大小 (可选，建议改大一点以免插件装不下，这里设为 512MB)
-        sed -i 's/CONFIG_TARGET_KERNEL_PARTSIZE=16/CONFIG_TARGET_KERNEL_PARTSIZE=32/' .config
-        sed -i 's/CONFIG_TARGET_ROOTFS_PARTSIZE=160/CONFIG_TARGET_ROOTFS_PARTSIZE=512/' .config
+        # 调整分区大小 (防止空间不足)
+        sed -i 's/CONFIG_TARGET_KERNEL_PARTSIZE=16/CONFIG_TARGET_KERNEL_PARTSIZE=64/' .config
+        sed -i 's/CONFIG_TARGET_ROOTFS_PARTSIZE=160/CONFIG_TARGET_ROOTFS_PARTSIZE=1024/' .config
 
-        # =======================================================
-
-        # 应用配置
         make defconfig
 
     - name: Download package
@@ -112,24 +117,27 @@ jobs:
         find dl -size -1024c -exec ls -l {} \;
         find dl -size -1024c -exec rm -f {} \;
 
+    # --- 修复核心：优化编译参数 ---
     - name: Compile the firmware
       id: compile
       run: |
         cd openwrt
         echo -e "$(nproc) thread compile"
+        
+        # 第一次尝试：多线程编译
+        # 如果失败，自动切换到单线程编译 (make -j1)
+        # 单线程虽然慢，但是最省内存，能极大减少崩溃概率
         make -j$(nproc) || make -j1 || make -j1 V=s
+        
         echo "status=success" >> $GITHUB_OUTPUT
 
     - name: Organize files
       id: organize
       if: steps.compile.outputs.status == 'success' && !cancelled()
       run: |
-        # 移动编译好的固件到 uploads 文件夹
         cd openwrt/bin/targets/*/*
         rm -rf packages
         
-        # 为了方便识别，只保留我们需要的 img.gz, iso, qcow2 格式
-        # 如果你想要所有文件，可以注释掉下面这几行
         mkdir -p $GITHUB_WORKSPACE/uploads
         mv *.iso $GITHUB_WORKSPACE/uploads/ 2>/dev/null || true
         mv *.qcow2 $GITHUB_WORKSPACE/uploads/ 2>/dev/null || true
