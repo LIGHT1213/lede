@@ -1,107 +1,153 @@
-# 
-# <https://github.com/KFERMercer/OpenWrt-CI>
-#
-# Copyright (C) 2019 P3TERX
-#
-# Copyright (C) 2020 KFERMercer
-#
-name: OpenWrt-CI
+name: Build LEDE (ISO & PVE/Qcow2) with Passwall & OpenClash
 
 on:
-  schedule:
-    - cron: 0 20 * * *
+  repository_dispatch:
+  workflow_dispatch:
+    inputs:
+      ssh:
+        description: 'SSH connection to Actions'
+        required: false
+        default: 'false'
 
-permissions:
-  contents: read
+env:
+  # 建议使用 coolsnowwolf 的官方源以保证最新，如果必须用 LIGHT1213 的 fork，请修改此处链接
+  REPO_URL: https://github.com/coolsnowwolf/lede
+  REPO_BRANCH: master
+  FEEDS_CONF: feeds.conf.default
+  CONFIG_FILE: .config
+  TZ: Asia/Shanghai
 
 jobs:
-
-  build_openwrt:
-
-    name: Build OpenWrt Firmware
-
+  build:
     runs-on: ubuntu-22.04
 
     steps:
-      - name: Space cleanup and Initialization environment
-        env:
-          DEBIAN_FRONTEND: noninteractive
-        run: |
-          docker rmi `docker images -q`
-          sudo -E rm -rf /usr/share/dotnet /etc/mysql /etc/php /etc/apt/sources.list.d /usr/local/lib/android
-          sudo -E apt-mark hold grub-efi-amd64-signed
-          sudo -E apt update
-          sudo -E apt -y purge azure-cli* docker* ghc* zulu* llvm* firefox google* dotnet* powershell* openjdk* mysql* php* mongodb* dotnet* snap*
-          sudo -E apt -y full-upgrade
-          sudo -E apt -y install ack antlr3 asciidoc autoconf automake autopoint binutils bison build-essential bzip2 ccache clang cmake cpio curl device-tree-compiler flex gawk gcc-multilib g++-multilib gettext genisoimage git gperf haveged help2man intltool libc6-dev-i386 libelf-dev libfuse-dev libglib2.0-dev libgmp3-dev libltdl-dev libmpc-dev libmpfr-dev libncurses5-dev libncursesw5-dev libpython3-dev libreadline-dev libssl-dev libtool llvm lrzsz msmtp ninja-build p7zip p7zip-full patch pkgconf python3 python3-pyelftools python3-setuptools qemu-utils rsync scons squashfs-tools subversion swig texinfo uglifyjs upx-ucl unzip vim wget xmlto xxd zlib1g-dev
-          sudo -E systemctl daemon-reload
-          sudo -E apt -y autoremove --purge
-          sudo -E apt clean
-          sudo -E timedatectl set-timezone "Asia/Shanghai"
+    - name: Checkout
+      uses: actions/checkout@v4
 
-      - name: Checkout OpenWrt
-        uses: actions/checkout@v4
+    - name: Initialization environment
+      env:
+        DEBIAN_FRONTEND: noninteractive
+      run: |
+        sudo rm -rf /etc/apt/sources.list.d/* /usr/share/dotnet /usr/local/lib/android /opt/ghc
+        sudo -E apt-get -qq update
+        sudo -E apt-get -qq install $(curl -fsSL git.io/depends-ubuntu-2204)
+        sudo -E apt-get -qq autoremove --purge
+        sudo -E apt-get -qq clean
+        sudo timedatectl set-timezone "$TZ"
+        sudo mkdir -p /workdir
+        sudo chown $USER:$USER /workdir
 
-      - name: Free Disk Space (Ubuntu)
-        uses: jlumbroso/free-disk-space@main
-        with:
-          # this might remove tools that are actually needed,
-          # if set to "true" but frees about 6 GB
-          tool-cache: true
-          # all of these default to true, but feel free to set to
-          # "false" if necessary for your workflow
-          android: true
-          dotnet: true
-          haskell: true
-          large-packages: true
-          swap-storage: true
+    - name: Clone source code
+      working-directory: /workdir
+      run: |
+        df -hT $PWD
+        git clone $REPO_URL -b $REPO_BRANCH openwrt
+        ln -sf /workdir/openwrt $GITHUB_WORKSPACE/openwrt
 
-      - name: Update feeds
-        run: |
-          sed -i 's/#src-git helloworld/src-git helloworld/g' ./feeds.conf.default
-          ./scripts/feeds update -a
-          ./scripts/feeds install -a
+    - name: Load custom feeds (Passwall & OpenClash)
+      run: |
+        cd openwrt
+        # 添加 Passwall 源
+        echo "src-git passwall_packages https://github.com/xiaorouji/openwrt-passwall-packages.git;main" >> "feeds.conf.default"
+        echo "src-git passwall https://github.com/xiaorouji/openwrt-passwall.git;main" >> "feeds.conf.default"
+        
+        # 添加 OpenClash
+        mkdir -p package/custom
+        git clone --depth 1 https://github.com/vernesong/OpenClash.git package/custom/luci-app-openclash
 
-      - name: Generate configuration file
-        run: make defconfig
+    - name: Update feeds
+      run: |
+        cd openwrt
+        ./scripts/feeds update -a
+        ./scripts/feeds install -a
 
-      - name: Download packages
-        run: make download -j16
+    - name: Load custom configuration
+      run: |
+        [ -e files ] && mv files openwrt/files
+        [ -e $CONFIG_FILE ] && mv $CONFIG_FILE openwrt/.config
+        
+        cd openwrt
+        
+        # 如果没有配置文件，先生成默认 x86_64 配置
+        if [ ! -f .config ]; then
+          make defconfig
+        fi
 
-      - name: Compile firmware
-        run: |
-          make -j$(nproc) || make -j1 V=s
-          echo "======================="
-          echo "Space usage:"
-          echo "======================="
-          df -h
-          echo "======================="
-          du -h --max-depth=1 ./ --exclude=build_dir --exclude=bin
-          du -h --max-depth=1 ./build_dir
-          du -h --max-depth=1 ./bin
+        # =======================================================
+        # 1. 强制开启 插件 (Passwall & OpenClash)
+        # =======================================================
+        sed -i 's/# CONFIG_PACKAGE_luci-app-passwall is not set/CONFIG_PACKAGE_luci-app-passwall=y/' .config
+        sed -i 's/# CONFIG_PACKAGE_luci-app-passwall_INCLUDE_Xray is not set/CONFIG_PACKAGE_luci-app-passwall_INCLUDE_Xray=y/' .config
+        sed -i 's/# CONFIG_PACKAGE_luci-app-passwall_INCLUDE_SingBox is not set/CONFIG_PACKAGE_luci-app-passwall_INCLUDE_SingBox=y/' .config
+        sed -i 's/# CONFIG_PACKAGE_luci-app-openclash is not set/CONFIG_PACKAGE_luci-app-openclash=y/' .config
 
-      - name: Prepare artifact
-        run: |
-          mkdir -p ./artifact/package
-          mkdir -p ./artifact/buildinfo
-          rm -rf $(find ./bin/targets/ -type d -name "packages")
-          cp -rf $(find ./bin/packages/ -type f -name "*.ipk") ./artifact/package/
-          cp -rf $(find ./bin/targets/ -type f -name "*.buildinfo" -o -name "*.manifest") ./artifact/buildinfo/
+        # =======================================================
+        # 2. 强制开启 镜像输出格式 (ISO 和 QCOW2)
+        # =======================================================
+        
+        # 启用 ISO 镜像 (Legacy / UEFI)
+        sed -i 's/# CONFIG_ISO_IMAGES is not set/CONFIG_ISO_IMAGES=y/' .config
+        
+        # 启用 QCOW2 镜像 (PVE/KVM 专用格式)
+        sed -i 's/# CONFIG_TARGET_IMAGES_QCOW2 is not set/CONFIG_TARGET_IMAGES_QCOW2=y/' .config
+        
+        # 确保生成 .img.gz (通用格式，PVE 也可以 importdisk 使用)
+        sed -i 's/# CONFIG_TARGET_IMAGES_GZIP is not set/CONFIG_TARGET_IMAGES_GZIP=y/' .config
+        
+        # 调整分区大小 (可选，建议改大一点以免插件装不下，这里设为 512MB)
+        sed -i 's/CONFIG_TARGET_KERNEL_PARTSIZE=16/CONFIG_TARGET_KERNEL_PARTSIZE=32/' .config
+        sed -i 's/CONFIG_TARGET_ROOTFS_PARTSIZE=160/CONFIG_TARGET_ROOTFS_PARTSIZE=512/' .config
 
-      - name: Upload buildinfo
-        uses: actions/upload-artifact@v4
-        with:
-          name: OpenWrt_buildinfo
-          path: ./artifact/buildinfo/
+        # =======================================================
 
-      - name: Upload package
-        uses: actions/upload-artifact@v4
-        with:
-          name: OpenWrt_package
-          path: ./artifact/package/
+        # 应用配置
+        make defconfig
 
-      - name: Upload firmware
-        uses: actions/upload-artifact@v4
-        with:
-          name: OpenWrt_firmware
-          path: ./bin/targets/
+    - name: Download package
+      id: package
+      run: |
+        cd openwrt
+        make download -j8
+        find dl -size -1024c -exec ls -l {} \;
+        find dl -size -1024c -exec rm -f {} \;
+
+    - name: Compile the firmware
+      id: compile
+      run: |
+        cd openwrt
+        echo -e "$(nproc) thread compile"
+        make -j$(nproc) || make -j1 || make -j1 V=s
+        echo "status=success" >> $GITHUB_OUTPUT
+
+    - name: Organize files
+      id: organize
+      if: steps.compile.outputs.status == 'success' && !cancelled()
+      run: |
+        # 移动编译好的固件到 uploads 文件夹
+        cd openwrt/bin/targets/*/*
+        rm -rf packages
+        
+        # 为了方便识别，只保留我们需要的 img.gz, iso, qcow2 格式
+        # 如果你想要所有文件，可以注释掉下面这几行
+        mkdir -p $GITHUB_WORKSPACE/uploads
+        mv *.iso $GITHUB_WORKSPACE/uploads/ 2>/dev/null || true
+        mv *.qcow2 $GITHUB_WORKSPACE/uploads/ 2>/dev/null || true
+        mv *.img.gz $GITHUB_WORKSPACE/uploads/ 2>/dev/null || true
+        mv *.config $GITHUB_WORKSPACE/uploads/ 2>/dev/null || true
+        
+        echo "FIRMWARE=$GITHUB_WORKSPACE/uploads" >> $GITHUB_ENV
+        echo "status=success" >> $GITHUB_OUTPUT
+
+    - name: Upload firmware directory
+      uses: actions/upload-artifact@v4
+      if: steps.organize.outputs.status == 'success' && !cancelled()
+      with:
+        name: OpenWrt_Firmware_ISO_PVE
+        path: ${{ env.FIRMWARE }}
+
+    - name: Delete workflow runs
+      uses: Mattraks/delete-workflow-runs@v2
+      with:
+        retain_days: 1
+        keep_minimum_runs: 3
